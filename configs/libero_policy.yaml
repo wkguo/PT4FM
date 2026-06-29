@@ -1,0 +1,126 @@
+# PT4FM stage-4: AWR-CFG + SFT-aux policy post-training for pi0.5
+#
+# Usage:
+#   bash scripts/4_train_policy.sh libero_policy
+#
+# Mirrors RLinf's examples/recap/cfg/config/libero_cfg_openpi.yaml and adds the
+# (config-gated) PT4FM knobs under actor.model.openpi:
+#   * awr      — continuous advantage weighting exp((A-Amax)/beta)
+#   * sft_aux  — explicit SFT flow-BC auxiliary anchor
+#
+# Reproduces RECAP exactly with: awr.enabled=false, sft_aux.mode=reuse_unconditional,
+# sft_aux.weight=1.0 (see docs/method.md "RECAP as a special case").
+
+defaults:
+  - model/pi0_5@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/sft/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: pt4fm
+    experiment_name: "pt4fm_policy"
+    logger_backends: ["tensorboard"]
+  max_epochs: 30000
+  max_steps: -1
+  val_check_interval: -1
+  save_interval: 3000
+
+data:
+  num_workers: 8
+  # Loads meta/advantages_{advantage_tag}.parquet (the PT4FM stage-3 output,
+  # which carries advantage + advantage_weight + is_demo columns).
+  advantage_tag: null
+  balance_dataset_weights: true
+  seed: 42
+  train_data_paths:
+    - dataset_path: "/path/to/sft_dataset"
+      type: "sft"
+      weight: 1.0
+    # - dataset_path: "/path/to/rollout_dataset"
+    #   type: "rollout"
+    #   weight: 1.0
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 32
+  global_batch_size: 512
+  seed: 0
+
+  model:
+    precision: null
+    model_path: "/path/to/pi05_base_pytorch"
+    model_type: "cfg_model"
+    add_value_head: False
+    openpi:
+      config_name: "pi05_libero"
+      cfgrl_guidance_scale: 1.0       # inference-time CFG strength
+      unconditional_prob: 0.1
+      train_expert_only: False
+      guidance_type: "positive"
+      positive_only_conditional: true
+
+      # -------- PT4FM: AWR continuous advantage weighting -------------------
+      # enabled=false => uniform weights (pure RECAP CFG).
+      awr:
+        enabled: true
+        beta: 0.7          # AWR temperature; larger => closer to uniform
+        w_max: 20.0        # clip on per-sample weight (variance control)
+
+      # -------- PT4FM: SFT flow-BC auxiliary anchor -------------------------
+      # mode:
+      #   reuse_unconditional — free; RL=conditional(AWR), SFT=unconditional(raw).
+      #                         weight=1.0 + awr off reproduces RECAP exactly.
+      #   separate_forward    — independent raw-prompt BC over demos (2x policy
+      #                         forward); the faithful "SFT-as-aux" objective.
+      sft_aux:
+        weight: 1.0
+        mode: "reuse_unconditional"
+        demo_only: true    # (separate_forward) restrict anchor to is_demo samples
+
+  optim:
+    lr: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    lr_warmup_steps: 5000
+    total_training_steps: 30000
+    min_lr: 0.0
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

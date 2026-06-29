@@ -1,0 +1,48 @@
+diff --git a/examples/recap/process/compute_advantages.py b/examples/recap/process/compute_advantages.py
+index e77b775b..c80aec2f 100644
+--- a/examples/recap/process/compute_advantages.py
++++ b/examples/recap/process/compute_advantages.py
+@@ -210,6 +210,14 @@ KEY_MAPPINGS = {
+         "state": "observation/state",
+         "task": "prompt",
+     },
++    "industrial_arm": {
++        # Pine Industrial_Arm 3-cam: view1 as base, hand as wrist (matches the
++        # value model's industrial_arm repack in recap/value_model.py).
++        "observation.images.view1": "observation/image",
++        "observation.images.hand": "observation/wrist_image",
++        "observation.state": "observation/state",
++        "task": "prompt",
++    },
+     "droid": {
+         "observation.exterior_image_1_left": "observation/exterior_image_1_left",
+         "observation.wrist_image_left": "observation/wrist_image_left",
+diff --git a/rlinf/data/datasets/recap/value_model.py b/rlinf/data/datasets/recap/value_model.py
+index b0691515..81f3b00f 100644
+--- a/rlinf/data/datasets/recap/value_model.py
++++ b/rlinf/data/datasets/recap/value_model.py
+@@ -65,6 +65,15 @@ _REPACK_KEYS = {
+         "actions": "action",
+         "prompt": "prompt",
+     },
++    "industrial_arm": {
++        # Pine Industrial_Arm 3-cam (value model uses view1 as base + hand as wrist);
++        # state is 13-D (pose+force/torque), padded to action_dim downstream.
++        "observation/image": "observation.images.view1",
++        "observation/wrist_image": "observation.images.hand",
++        "observation/state": "observation.state",
++        "actions": "action",
++        "prompt": "prompt",
++    },
+     "franka": {
+         "observation/image": "image",
+         "observation/state": "state",
+@@ -314,7 +323,7 @@ class ValueDataset(Dataset):
+             )
+         transforms_list.append(_openpi_transforms.RepackTransform(repack_keys))
+ 
+-        if robot in ("libero", "libero_v2"):
++        if robot in ("libero", "libero_v2", "industrial_arm"):
+             transforms_list.append(
+                 libero_policy.LiberoInputs(model_type=model_type_enum)
+             )
