@@ -24,12 +24,14 @@ cd RLinf && git apply ../PT4FM/patches/rlinf_industrial_arm.patch && cd ..
 ## 2. Environment
 ```bash
 conda create -n vla_pt python=3.11 -y && conda activate vla_pt
-# CUDA wheels first:
+# 1. CUDA wheels (must come first):
 pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
 pip install "jax[cuda13]==0.7.2"
-# the rest:
+# 2. torchcodec — MUST use the cu128 index (PyPI default is cu13 and fails with libnvrtc.so.13):
+pip install --no-deps torchcodec --index-url https://download.pytorch.org/whl/cu128
+# 3. the rest:
 pip install -r PT4FM/requirements.txt
-# editable installs so `import openpi` = the fork, and rlinf is importable:
+# 4. editable installs so `import openpi` = the fork, and rlinf is importable:
 pip install -e openpi
 pip install -e RLinf            # or add RLinf to PYTHONPATH
 ```
@@ -74,30 +76,70 @@ PYTHONPATH=$SHIM:$PT4FM:$RLINF REPO_PATH=$RLINF $PY train_value.py --config-name
   actor.model.tokenizer_path=<M>/gemma-3-270m actor.model.action_dim=32 actor.model.action_horizon=10
 
 # 3  advantages (GPU) -> <DS>/meta/advantages_ram_N10_q30.parquet
+#    FSDP_USE_ORIG_PARAMS=1 is REQUIRED: it rebuilds the value model in uniform bf16 to
+#    match the FSDP-trained checkpoint; without it inference uses a mixed-precision build
+#    (SigLIP embeddings fp32) and crashes with a layernorm/matmul dtype mismatch.
 cd $RLINF/examples/recap/process
-PYTHONPATH=$SHIM:$PT4FM:$RLINF $PY compute_advantages.py --config-name compute_advantages \
+FSDP_USE_ORIG_PARAMS=1 PYTHONPATH=$SHIM:$PT4FM:$RLINF $PY compute_advantages.py --config-name compute_advantages \
   advantage.value_checkpoint=<VALUE_CKPT> advantage.tag=ram_N10_q30 advantage.returns_tag=ram advantage.positive_quantile=0.3 \
   advantage.model.siglip_path=<M>/siglip2-so400m-patch14-224 advantage.model.gemma3_path=<M>/gemma-3-270m \
   advantage.model.tokenizer_path=<M>/gemma-3-270m \
   data.train_data_paths="[{dataset_path:<DS>,type:rollout,robot_type:industrial_arm}]" \
   data.model_type=pi05 data.robot_type=industrial_arm data.advantage_lookahead_step=10 data.gamma=1.0
+#    On a shared/busy GPU add: advantage.batch_size=96 advantage.num_dataloader_workers_per_gpu=4
+#    and CUDA_VISIBLE_DEVICES=<free_gpu> PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # 4  JAX policy training (CFG; resume foundry/50000)
+#    Bool flags use tyro switch syntax: --flag (True) / --no-flag (False), no value argument.
+#    <DS> must be an absolute path (repo_id is used directly as a local filesystem root).
+#    Use CUDA_VISIBLE_DEVICES to select GPUs; XLA_PYTHON_CLIENT_MEM_FRACTION controls JAX mem.
 cd $OPENPI
-PYTHONPATH=$OPENPI/src $PY scripts/train_offline_rl.py pine_foundry_rl --exp-name ram_recap \
+RUN_NAME=ram_$(date +%Y%m%d_%H%M%S)    # wandb run name; exp_name also sets the checkpoint subdir
+CUDA_VISIBLE_DEVICES=0,1 XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 \
+PYTHONPATH=$OPENPI/src $PY scripts/train_offline_rl.py pine_foundry_rl \
+  --project-name pi05_RECAP --exp-name "$RUN_NAME" \
   --data.repo-id <DS> --weight-loader.params-path <M>/foundry_policy/50000/params \
   --offline-rl.advantage-tag ram_N10_q30 \
-  --offline-rl.cfg.enabled True --offline-rl.cfg.positive-only-conditional True --offline-rl.cfg.uncond-prob 0.1 \
-  --offline-rl.awr.enabled False --offline-rl.sft-aux.mode reuse_unconditional --offline-rl.sft-aux.weight 1.0 \
-  --fsdp-devices 3 --batch-size 24
+  --offline-rl.cfg.enabled --offline-rl.cfg.positive-only-conditional \
+  --offline-rl.cfg.uncond-prob 0.1 \
+  --offline-rl.awr.no-enabled \
+  --fsdp-devices 2 --batch-size 64
 ```
 
 See [docs/jax_migration.md](docs/jax_migration.md), [docs/method.md](docs/method.md),
 [docs/pipeline.md](docs/pipeline.md), [docs/custom_data.md](docs/custom_data.md) for details.
 
 ## Notes
-- Stages 2-3 must keep `PYTHONPATH=$SHIM:...` (RLinf RECAP imports `lerobot.common`; the shim
+- **Stages 2-3** must keep `PYTHONPATH=$SHIM:...` (RLinf RECAP imports `lerobot.common`; the shim
   redirects to `lerobot.datasets` and patches the PyAV video path under lerobot 0.3.x).
-- `robot_type=industrial_arm` is added by `patches/rlinf_industrial_arm.patch` (view1→base, hand→wrist).
+- **Stage 3** needs `FSDP_USE_ORIG_PARAMS=1` (forces uniform bf16, matching the FSDP-trained value
+  checkpoint; without it the value model rebuilds in mixed precision and crashes with a layernorm /
+  matmul dtype mismatch at the first inference forward).
+- **Stage 4** (`--data.repo-id`) requires an **absolute path** (used directly as a filesystem root,
+  not a HuggingFace repo id). Bool flags are tyro switch syntax: `--flag` / `--no-flag`.
+  wandb is enabled by default; set `WANDB_API_KEY` or run `wandb login` beforehand.
+- **Video decoding**: install `torchcodec` from the cu128 index (see §2); lerobot then auto-selects
+  it as the fastest backend. The PT4FM compat shim ships a PyAV fallback for environments where
+  torchvision lacks VideoReader and torchcodec is unavailable (stages 2-3 via `$SHIM`).
+- `robot_type=industrial_arm` is added by `patches/rlinf_industrial_arm.patch` (5 files: view/state
+  key mapping, checkpoint_utils build_input_transforms, value model inference dtype cast, eval-loader
+  guard).
 - Keep `action_dim=32` for the value model (13-D state pads up; never set 7).
 - `failure_reward / positive_quantile / advantage_lookahead_step` are tunable; values above are the baseline.
+
+## Visualization
+After stage 3, visualize value + advantage to sanity-check the value model:
+```bash
+# V(o_t) curve + frame strip per episode (paper-style)
+PYTHONPATH=$PT4FM $PY -m pt4fm.process.visualize_value \
+  --dataset <DS> --tag ram_N10_q30 --num-frames 8 --success-ep <id> --failure-ep <id>
+
+# Per-frame advantage curve + frame strip
+PYTHONPATH=$PT4FM $PY -m pt4fm.process.visualize_advantage \
+  --dataset <DS> --tag ram_N10_q30 --num-frames 8 --success-ep <id> --failure-ep <id>
+
+# Annotate raw video with V(o_t) overlay (drawdown coloring: red=value drop not yet recovered)
+PYTHONPATH=$PT4FM $PY -m pt4fm.process.annotate_value_video \
+  --dataset <DS> --tag ram_N10_q30 --success-ep <id> --failure-ep <id>
+# optional: --tolerance 0.02 (ignore sub-0.02 dips), --cameras observation.images.view1
+```
